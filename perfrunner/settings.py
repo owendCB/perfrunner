@@ -14,9 +14,9 @@ LOCAL_BROKER_URL = 'sqla+sqlite:////tmp/perfrunner.db'
 
 SHOWFAST = {'host': 'showfast.sc.couchbase.com', 'password': 'password'}
 
-CBMONITOR = {'host': 'cbmonitor.sc.couchbase.com', 'password': 'password'}
+CBMONITOR = {'host': 'localhost:8000', 'password': 'password'}
 
-SERIESLY = {'host': 'cbmonitor.sc.couchbase.com', 'password': 'password'}
+SERIESLY = {'host': 'localhost', 'password': 'password'}
 
 SGW_SERIESLY_HOST = '172.23.106.228'
 
