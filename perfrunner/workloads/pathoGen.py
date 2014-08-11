@@ -1,14 +1,20 @@
 #!/usr/bin/env python
 
-"""PathoGen: Attempt to create a pathologically bad workload for malloc fragmentation.
+"""PathoGen: Attempt to create pathologically bad workloads for malloc fragmentation.
 
-Rationale: Create a set of documents and then update their sizes to
+Rationale
+=========
+
+Create a set of documents and then update their sizes to
 each different size class of the underlying allocator. Do this across
 different threads (different CouchbaseClient objects), to emulate
 diferent clients accessing them, and to cause malloc/free in memcached
 across different threads.
 
-Implementation: Spawn a number of worker threads, arranged in a ring,
+Implementation
+==============
+
+Spawn a number of worker threads, arranged in a ring,
 with a queue linking each pair of Workers:
 
 
@@ -23,7 +29,7 @@ with a queue linking each pair of Workers:
 
 Queue 1 is initially populated with 10,000 generator functions, each
 of which returns a sequence of ascending document sizes [8, 16,
-32...262144]. Each has it's own input queue (which is also the output
+32...MAX_SIZE]. Each has it's own input queue (which is also the output
 queue of the previous Worker). A worker pops a generator off it's
 input queue, performs a Couchbase.set() of the next size, and then
 pushes the generator onto it's output queue, for the next worker to
@@ -35,7 +41,10 @@ queue to drain and memory to stabilize), then the whole process is
 repeated (setting all documents back to 8 bytes) for the given number
 of iterations.
 
-Behaviour: This gives a multiple different clients working on the same
+Behaviour
+=========
+
+This gives a multiple different clients working on the same
 keys, which means that memory for the documents in memcached should be
 malloc'd and free'd by different memcached threads (to stress the
 allocator). Additionally, the workload should be deterministic.
@@ -48,10 +57,45 @@ we reset back to the smallest size again.
 
 Note (2), that num of workers should be co-prime with #documents, to
 ensure that each worker sets a given document to different sizes.
+
+Variants
+========
+
+"Frozen mode"
+----------------
+
+In the baseline case (described above), at the
+start of each iteration all documents are back to the same size
+(8B). This does not stress how the allocator handles "frozen"
+documents - ones which stay at a given size and are not resized (which
+means they cannot be re-packed during resize by the allocator).
+
+Frozen mode tries to addresses this by not always resizing all
+documents, leaving some 'frozen' and not subsequently changed. At each
+iteration, a small percentage of documents are not added to the output
+queue, and instead will remain at the last set size:
+
+  AAAAAAAAAAAAAAA  iteration 1: size    8 bytes, 1000 documents
+   BBBBBBBBBBBBB   iteration 1: size   16 bytes,  990 documents
+    CCCCCCCCCCC    ...
+     DDDDDDDDD     iteration 1: size 4096 bytes,  500 documents
+      EEEEEEE      iteration 2: size    8 bytes,  495 documents
+       FFFFF       iteration 2: size   16 bytes,  490 documents
+        GGG        ...
+         H         iteration N: size 4096 bytes,   10 documents
+
+The effect on size-class basec allocators (e.g. tcmalloc & jemalloc)
+is that they will end up with multiple pages which are assigned to
+particular size (e.g. 16 bytes), but only a small fraction of each
+page is actually occupied - for example two pages could exist for 16B
+allocations, but after running in freeze mode there is just one slot
+occupied on each page - so 32/8192 bytes are acutally used, with 8160B
+"unused" or fragmented.
 """
 
 import itertools
 import Queue
+import random
 import time
 import threading
 
@@ -59,13 +103,47 @@ from couchbase import Couchbase, FMT_BYTES, exceptions
 from logger import logger
 
 
+class AlwaysPromote(object):
+    """Promotion policy for baseline case - always promote."""
+
+    def should_promote(self, id):
+        return True
+
+
+class Freeze(object):
+
+    def __init__(self, num_items, num_iterations):
+        self.num_items = num_items
+        # Initialize deterministic pseudo-RNG for when to freeze docs.
+        self.lock = threading.Lock()
+        self.rng = random.Random(0)
+        self.freeze_probability = 0.03 / num_iterations
+
+    def should_promote(self, id):
+        # Always promote the last document, as we use it to detect
+        # when an iteration has completed.
+        if id == self.num_items - 1:
+            return True
+        # Otherwise retire a percentage randomly.
+        with self.lock:
+            return self.rng.random() > self.freeze_probability
+
+
 class PathoGen(object):
     """Main generator class, responsible for orchestrating the process."""
 
-    def __init__(self, num_items, num_workers, num_iterations, host,
+    def __init__(self, num_items, num_workers, num_iterations, frozen_mode, host,
                  port, bucket):
         self.num_items = num_items
         self.num_workers = num_workers
+
+        if frozen_mode:
+            promotion_policy = Freeze(num_items, num_iterations)
+            max_size = 8192  # TCMalloc page size.
+        else:
+            promotion_policy = AlwaysPromote()
+            max_size = 262144
+
         # Create queues
         self.queues = list()
         for i in range(self.num_workers):
@@ -79,12 +157,15 @@ class PathoGen(object):
                 t = Supervisor(number=i, host=host, port=port, bucket=bucket,
                                in_queue=self.queues[i],
                                out_queue=self.queues[(i + 1) % self.num_workers],
+                               promotion_policy=promotion_policy,
                                num_items=self.num_items,
-                               num_iterations=num_iterations)
+                               num_iterations=num_iterations,
+                               max_size=max_size)
             else:
                 t = Worker(number=i, host=host, port=port, bucket=bucket,
                            in_queue=self.queues[i],
-                           out_queue=self.queues[(i + 1) % self.num_workers])
+                           out_queue=self.queues[(i + 1) % self.num_workers],
+                           promotion_policy=promotion_policy)
             self.threads.append(t)
 
     def run(self):
@@ -111,14 +192,16 @@ class Worker(threading.Thread):
              180224, 188416, 196608, 204800, 212992, 221184, 229376,
              237568, 245760, 253952, 262144)
 
-    def __init__(self, number, host, port, bucket, in_queue, out_queue):
+    def __init__(self, number, host, port, bucket, in_queue,
+                 out_queue, promotion_policy):
         threading.Thread.__init__(self)
         self.id = number
         self.in_queue = in_queue
         self.out_queue = out_queue
+        self.promotion_policy = promotion_policy
         self.client = Couchbase.connect(bucket=bucket, host=host, port=port)
 
-        # Pre-generate a buffer to use for constructing documents.
+        # Pre-generate a buffer of the maximum size to use for constructing documents.
         self.buffer = bytearray('x' for _ in range(self.SIZES[-1]))
 
     def run(self):
@@ -127,6 +210,7 @@ class Worker(threading.Thread):
         output queue for the next guy.
         """
         while True:
+            next_size = None
             (i, doc) = self.in_queue.get()
             # We use a "magic" null generator to terminate the workers
             if not doc:
@@ -139,7 +223,10 @@ class Worker(threading.Thread):
                 self._set_with_retry('doc_' + str(i), value)
             except StopIteration:
                 pass
-            self.out_queue.put((i, doc))
+            # Only promote (i.e. add to the next worker's queue) if our policy
+            # permits.
+            if self.promotion_policy.should_promote(i):
+                self.out_queue.put((i, doc))
 
     def _set_with_retry(self, key, value):
         success = False
@@ -161,17 +248,20 @@ class Supervisor(Worker):
     SLEEP_TIME = 10
 
     def __init__(self, number, host, port, bucket, in_queue,
-                 out_queue, num_items, num_iterations):
+                 out_queue, promotion_policy, num_items, num_iterations, max_size):
         super(Supervisor, self).__init__(number, host, port, bucket,
-                                         in_queue, out_queue)
+                                         in_queue, out_queue,
+                                         promotion_policy)
         self.num_items = num_items
         self.num_iterations = num_iterations
+        self.max_size = max_size
 
     def _build_generator(self, i):
         """Returns a sequence of sizes which ramps from minimum to maximum
         size.
         """
-        return itertools.islice(self.SIZES, None)
+        return itertools.islice(self.SIZES[:self.SIZES.index(self.max_size)],
+                                None)
 
     def run(self):
         """Run the Supervisor. This is similar to Worker, except that
@@ -180,11 +270,20 @@ class Supervisor(Worker):
         iteration is started.
         """
         logger.info('Starting PathoGen supervisor')
+
+        # Create initial list of documents on the 'finished' queue
+        finished_items = list()
+        for i in range(self.num_items):
+            finished_items.append(i)
+
         for iteration in range(self.num_iterations):
-            # Add document iterators to our out queue. (i.e. first worker's
-            # input queue).
-            for i in range(self.num_items):
+
+            # Create a generator for each item in the finished queue.
+            # For the first iteration this will be all items, for subsequent
+            # iterations it may be fewer if some have been frozen.
+            for i in list(finished_items):
                 self.out_queue.put((i, self._build_generator(i)))
+                finished_items.remove(i)
 
             while True:
                 (i, doc) = self.in_queue.get()
@@ -192,29 +291,39 @@ class Supervisor(Worker):
                     next_size = doc.next()
                     value = self.buffer[:next_size]
                     self._set_with_retry('doc_' + str(i), value)
-                    self.out_queue.put((i, doc))
+                    # Only promote (i.e. add to the next worker's queue) if our policy
+                    # permits.
+                    if self.promotion_policy.should_promote(i):
+                        self.out_queue.put((i, doc))
                 except StopIteration:
-                    # Note: Items are not put back on out_queue at end of
-                    # iterator (unlike Worker)
+                    # Note: Items are not put back on out_queue at end of an
+                    # iteration (unlike Worker), instead we keep for the next
+                    # iteration, to build the new generators.
+                    finished_items.append(i)
+                    # Last document, end of iteration.
                     if i == self.num_items - 1:
                         break
 
             assert self.in_queue.empty()
+            assert self.out_queue.empty()
 
-            logger.info('Completed iteration {}/{}, sleeping for {}s'.format(
-                iteration + 1, self.num_iterations, self.SLEEP_TIME))
+            logger.info('Completed iteration {}/{}, frozen {} documents (aggregate). sleeping for {}s'.format(
+                iteration + 1, self.num_iterations,
+                self.num_items - len(finished_items), self.SLEEP_TIME))
             # Sleep at end of iteration to give disk write queue chance to drain.
             time.sleep(self.SLEEP_TIME)
 
         # All iterations complete. Send a special null generator
         # document around the ring - this tells the workers to shutdown.
-        # Finally, set all documents back to size zero.
-        for i in range(self.num_items):
-            self.out_queue.put((i, None))
+        self.out_queue.put((-1, None))
+
+        # Finally, set all remaining documents back to size zero.
+        for i in list(finished_items):
             self._set_with_retry('doc_' + str(i), self.buffer[:0])
 
 
 if __name__ == '__main__':
     # Small smoketest
-    PathoGen(num_items=1000, num_workers=5, num_iterations=3,
-             host='localhost', port=8091, bucket='default').run()
+    PathoGen(num_items=1000, num_workers=9, num_iterations=10,
+             frozen_mode=True, host='localhost', port=8091,
+             bucket='bucket-1').run()
