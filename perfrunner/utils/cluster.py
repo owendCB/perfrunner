@@ -236,8 +236,8 @@ def main():
     cm.configure_auto_compaction()
     cm.enable_auto_failover()
     cm.change_watermarks()
-    cm.tweak_memory()
-    cm.remote.disable_wan()
+#    cm.tweak_memory()
+#    cm.remote.disable_wan()
     cm.start_cbq_engine()
 
 if __name__ == '__main__':

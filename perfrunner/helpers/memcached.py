@@ -32,12 +32,12 @@ class MemcachedHelper(object):
 
     def set_flusher_param(self, host, bucket, key, value):
         logger.info('Changing flusher params: {}={}'.format(key, value))
-        mc = MemcachedClient(host=host, port=11210)
+        mc = MemcachedClient(host=host, port=12000)
         mc.sasl_auth_plain(user=bucket, password=self.password)
         mc.set_param(key, value, memcacheConstants.ENGINE_PARAM_FLUSH)
 
     @retry
     def get_stats(self, host, bucket, stats):
-        mc = MemcachedClient(host=host, port=11210)
+        mc = MemcachedClient(host=host, port=12000)
         mc.sasl_auth_plain(user=bucket, password=self.password)
         return mc.stats(stats)

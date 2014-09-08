@@ -8,11 +8,11 @@ from logger import logger
 
 REPO = 'https://github.com/couchbaselabs/perfrunner'
 
-SHOWFAST = {'host': 'showfast.sc.couchbase.com', 'password': 'password'}
+SHOWFAST = {'host': 'localhost', 'password': 'mancouch'}
 
-CBMONITOR = {'host': 'cbmonitor.sc.couchbase.com', 'password': 'password'}
+CBMONITOR = {'host': 'mancouch:8000', 'password': 'password'}
 
-SERIESLY = {'host': 'cbmonitor.sc.couchbase.com'}
+SERIESLY = {'host': 'mancouch'}
 
 
 @decorator
