@@ -221,6 +221,10 @@ class Worker(multiprocessing.Process):
         self.buffer = bytearray('x' for _ in range(SIZES[-1]))
 
     def run(self):
+#        return self._run()
+        cProfile.runctx('self._run()', globals(), locals(), 'worker%d.prof' % self.id)
+
+    def _run(self):
         """Run a Worker. They run essentially forever, taking document
         size iterators from the input queue and adding them to the
         output queue for the next guy.
