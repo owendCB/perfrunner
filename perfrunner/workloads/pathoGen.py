@@ -275,7 +275,7 @@ class SequenceIterator(object):
 
 class Supervisor(Worker):
 
-    SLEEP_TIME = 10
+    SLEEP_TIME = 0
 
     def __init__(self, number, host, port, bucket, queues, in_queue,
                  out_queue, promotion_policy, num_items, num_iterations, max_size):
@@ -361,6 +361,6 @@ class Supervisor(Worker):
 
 if __name__ == '__main__':
     # Small smoketest
-    PathoGen(num_items=1000, num_workers=9, num_iterations=10,
-             frozen_mode=True, host='localhost', port=8091,
+    PathoGen(num_items=1000, num_workers=17, num_iterations=10,
+             frozen_mode=True, host='localhost', port=9000,
              bucket='bucket-1').run()
