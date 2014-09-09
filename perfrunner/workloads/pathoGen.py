@@ -93,7 +93,7 @@ occupied on each page - so 32/8192 bytes are acutally used, with 8160B
 "unused" or fragmented.
 """
 
-import collections
+import cProfile
 import itertools
 import multiprocessing
 import random
@@ -102,7 +102,6 @@ import time
 from couchbase import Couchbase, FMT_BYTES, exceptions
 from logger import logger
 
-output_lock = multiprocessing.Lock()
 
 # TCMalloc size classes
 SIZES = (8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192,
@@ -201,7 +200,7 @@ class Worker(multiprocessing.Process):
         self.out_queue = out_queue
         self.promotion_policy = promotion_policy
         self.client = Couchbase.connect(bucket=bucket, host=host, port=port)
-        self.stats = collections.Counter()
+
         # Pre-generate a buffer of the maximum size to use for constructing documents.
         self.buffer = bytearray('x' for _ in range(SIZES[-1]))
 
@@ -229,16 +228,12 @@ class Worker(multiprocessing.Process):
             if self.promotion_policy.should_promote(i):
                 self.out_queue.put((i, doc))
 
-        with output_lock:
-            logger.info('Worker-{0}: Set {1} different sized documents.'.format(self.id, len(self.stats)))
-
     def _set_with_retry(self, key, value):
         success = False
         backoff = 0.01
         while not success:
             try:
                 self.client.set(key, value, format=FMT_BYTES)
-                self.stats[len(value)] += 1
                 success = True
             except (exceptions.TimeoutError,
                     exceptions.TemporaryFailError) as e:
