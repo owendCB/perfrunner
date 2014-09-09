@@ -118,30 +118,45 @@ SIZES = (8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192,
 class AlwaysPromote(object):
     """Promotion policy for baseline case - always promote."""
 
-    def should_promote(self, id):
-        return True
+    def __init__(self, num_items, num_iterations, max_size):
+        self.max_size = max_size
+
+    def build_generator(self):
+        return SequenceIterator(self.max_size)
 
 
 class Freeze(object):
 
-    def __init__(self, num_items, num_iterations):
+    def __init__(self, num_items, num_iterations, max_size):
         self.num_items = num_items
         # Initialize deterministic pseudo-RNG for when to freeze docs.
-        self.lock = multiprocessing.Lock()
         self.rng = random.Random(0)
-        self.freeze_probability = 0.03 / num_iterations
+        self.lock = multiprocessing.Lock()
+        # Aim to have 10% of documents left at the end.
+        self.freeze_probability = self._calc_freeze_probability(num_iterations=num_iterations,
+                                                                final_fraction=0.2)
+        self.max_size = max_size
 
-    def should_promote(self, id):
-        # Always promote the last document, as we use it to detect
-        # when an iteration has completed.
-        if id == self.num_items - 1:
-            return True
-        # Otherwise retire a percentage randomly.
-        with self.lock:
-            return self.rng.random() > self.freeze_probability
+    def build_generator(self, i):
+        """Returns a sequence of sizes which ramps from minimum to maximum
+        size. If 'freeze' is true, then freeze the sequence at a random position, i.e.
+        don't ramp all the way up to max_size.
+        """
+        if self.rng.random() < self.freeze_probability:
+            return SequenceIterator(self.rng.choice(SIZES[:SIZES.index(self.max_size)]))
+        else:
+            return SequenceIterator(self.max_size)
+
+    def _calc_freeze_probability(self, num_iterations, final_fraction):
+        """Return the freeze probability (per iteration) required to obtain
+        an the fiven aggregate final frozen fraction.
+        """
+        return 1.0 - (final_fraction ** (1.0 / num_iterations))
+
 
 
 class PathoGen(object):
+
     """Main generator class, responsible for orchestrating the process."""
 
     def __init__(self, num_items, num_workers, num_iterations, frozen_mode, host,
@@ -150,11 +165,11 @@ class PathoGen(object):
         self.num_workers = num_workers
 
         if frozen_mode:
-            promotion_policy = Freeze(num_items, num_iterations)
             max_size = 8192  # TCMalloc page size.
+            promotion_policy = Freeze(num_items, num_iterations, max_size)
         else:
-            promotion_policy = AlwaysPromote()
             max_size = 262144
+            promotion_policy = AlwaysPromote()
 
         # Create queues
         self.queues = list()
@@ -167,6 +182,7 @@ class PathoGen(object):
             if i == self.num_workers - 1:
                 # Last one is the Supervisor
                 t = Supervisor(number=i, host=host, port=port, bucket=bucket,
+                               queues = self.queues,
                                in_queue=self.queues[i],
                                out_queue=self.queues[(i + 1) % self.num_workers],
                                promotion_policy=promotion_policy,
@@ -211,22 +227,21 @@ class Worker(multiprocessing.Process):
         """
         while True:
             next_size = None
-            (i, doc) = self.in_queue.get()
+            (i, doc, size) = self.in_queue.get()
             # We use a "magic" null generator to terminate the workers
             if not doc:
                 # Pass the death on...
-                self.out_queue.put((i, doc))
+                self.out_queue.put((i, doc, size))
                 break
+            # Actually perform the set.
             try:
                 next_size = doc.next()
                 value = self.buffer[:next_size]
                 self._set_with_retry('doc_' + str(i), value)
+                size = next_size
             except StopIteration:
                 pass
-            # Only promote (i.e. add to the next worker's queue) if our policy
-            # permits.
-            if self.promotion_policy.should_promote(i):
-                self.out_queue.put((i, doc))
+            self.out_queue.put((i, doc, size))
 
     def _set_with_retry(self, key, value):
         success = False
@@ -245,7 +260,7 @@ class Worker(multiprocessing.Process):
 
 class SequenceIterator(object):
     def __init__(self, max_size):
-        self.sizes = list(SIZES[:SIZES.index(max_size)])
+        self.sizes = list(SIZES[:SIZES.index(max_size) + 1])
 
     def next(self):
         if self.sizes:
@@ -258,20 +273,15 @@ class Supervisor(Worker):
 
     SLEEP_TIME = 10
 
-    def __init__(self, number, host, port, bucket, in_queue,
+    def __init__(self, number, host, port, bucket, queues, in_queue,
                  out_queue, promotion_policy, num_items, num_iterations, max_size):
         super(Supervisor, self).__init__(number, host, port, bucket,
                                          in_queue, out_queue,
                                          promotion_policy)
+        self.queues = queues
         self.num_items = num_items
         self.num_iterations = num_iterations
         self.max_size = max_size
-
-    def _build_generator(self, i):
-        """Returns a sequence of sizes which ramps from minimum to maximum
-        size.
-        """
-        return SequenceIterator(self.max_size)
 
     def run(self):
         """Run the Supervisor. This is similar to Worker, except that
@@ -284,51 +294,64 @@ class Supervisor(Worker):
         # Create initial list of documents on the 'finished' queue
         finished_items = list()
         for i in range(self.num_items):
-            finished_items.append(i)
+            finished_items.append((i, 0))
 
         for iteration in range(self.num_iterations):
 
-            # Create a generator for each item in the finished queue.
-            # For the first iteration this will be all items, for subsequent
-            # iterations it may be fewer if some have been frozen.
-            for i in list(finished_items):
-                self.out_queue.put((i, self._build_generator(i)))
-                finished_items.remove(i)
+            # Create a tuple for each item in the finished queue, of
+            # (doc_id, generator, doc_size). For the first iteration
+            # this will be all items, for subsequent iterations it may
+            # be fewer if some have been frozen.
+            # Spread these across the input queues of all workers, to ensure
+            # that each worker operates on different sizes.
+            expected_items = len(finished_items)
+            num_queues = len(self.queues)
+            for (i, size) in list(finished_items):
+                queue_index = i % num_queues
+                self.queues[queue_index].put(
+                    (i,
+                     self.promotion_policy.build_generator(i),
+                     0))
+            finished_items = list()
 
-            while True:
-                (i, doc) = self.in_queue.get()
+            while expected_items > 0:
+                (i, doc, size) = self.in_queue.get()
                 try:
                     next_size = doc.next()
                     value = self.buffer[:next_size]
                     self._set_with_retry('doc_' + str(i), value)
-                    # Only promote (i.e. add to the next worker's queue) if our policy
-                    # permits.
-                    if self.promotion_policy.should_promote(i):
-                        self.out_queue.put((i, doc))
+                    size = next_size
+                    self.out_queue.put((i, doc, size))
                 except StopIteration:
                     # Note: Items are not put back on out_queue at end of an
                     # iteration (unlike Worker), instead we keep for the next
                     # iteration, to build the new generators.
-                    finished_items.append(i)
-                    # Last document, end of iteration.
-                    if i == self.num_items - 1:
+                    finished_items.append((i, size))
+                    if len(finished_items) == expected_items:
+                        # Got all items, end of iteration.
                         break
 
             assert self.in_queue.empty()
             assert self.out_queue.empty()
 
-            logger.info('Completed iteration {}/{}, frozen {} documents (aggregate). sleeping for {}s'.format(
+            # Any finished items which didn't reach max size should be
+            # removed from the next iteration - we want to leave them
+            # frozen at their last size.
+            finished_items = [(i, size) for (i, size) in finished_items if size == self.max_size]
+
+            logger.info('Completed iteration {}/{}, frozen {}/{} documents (aggregate). sleeping for {}s'.format(
                 iteration + 1, self.num_iterations,
-                self.num_items - len(finished_items), self.SLEEP_TIME))
+                self.num_items - len(finished_items), self.num_items,
+                self.SLEEP_TIME))
             # Sleep at end of iteration to give disk write queue chance to drain.
             time.sleep(self.SLEEP_TIME)
 
         # All iterations complete. Send a special null generator
         # document around the ring - this tells the workers to shutdown.
-        self.out_queue.put((-1, None))
+        self.out_queue.put((-1, None, 0))
 
         # Finally, set all remaining documents back to size zero.
-        for i in list(finished_items):
+        for (i, size) in list(finished_items):
             self._set_with_retry('doc_' + str(i), self.buffer[:0])
 
 
