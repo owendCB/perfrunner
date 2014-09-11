@@ -361,6 +361,6 @@ class Supervisor(Worker):
 
 if __name__ == '__main__':
     # Small smoketest
-    PathoGen(num_items=10000, num_workers=17, num_iterations=10,
+    PathoGen(num_items=100000, num_workers=21, num_iterations=20,
              frozen_mode=True, host='localhost', port=9000,
              bucket='bucket-1').run()
