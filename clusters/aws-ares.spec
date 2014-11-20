@@ -1,6 +1,9 @@
 [clusters]
 aws-ares =
     10.0.0.250:8091
+    10.0.0.233:8091
+    10.0.0.234:8091
+    10.0.0.235:8091
 
 [clients]
 hosts = ec2-54-173-47-70.compute-1.amazonaws.com
