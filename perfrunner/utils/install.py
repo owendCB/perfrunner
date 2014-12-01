@@ -16,6 +16,7 @@ class CouchbaseInstaller(object):
 
     CBFS = 'http://cbfs-ext.hq.couchbase.com/builds/'
     LATEST_BUILDS = 'http://latestbuilds.hq.couchbase.com/'
+    AWS_SHOWFAST = 'http://10.0.0.133/'
 
     def __init__(self, cluster_spec, options):
         self.remote = RemoteHelper(cluster_spec, None, options.verbose)
@@ -64,7 +65,7 @@ class CouchbaseInstaller(object):
 
     def find_package(self):
         for filename in self.get_expected_filenames():
-            for base in (self.LATEST_BUILDS, self.CBFS):
+            for base in (self.LATEST_BUILDS, self.CBFS, self.AWS_SHOWFAST):
                 url = '{}{}'.format(base, filename)
                 try:
                     status_code = requests.head(url).status_code
