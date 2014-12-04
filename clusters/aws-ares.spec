@@ -6,7 +6,7 @@ aws-ares =
     10.0.0.235:8091
 
 [clients]
-hosts = ec2-54-174-145-241.compute-1.amazonaws.com
+hosts = ec2-54-85-122-76.compute-1.amazonaws.com
 credentials = root:couchbase
 
 [storage]
