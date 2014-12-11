@@ -125,7 +125,7 @@ class ClusterManager(object):
 
     def restart_with_alternative_bucket_options(self):
         cmd = 'ns_bucket:update_bucket_props("{}", ' \
-              '[{{extra_config_string, "{}={}"}}]).'
+              '[{{extra_config_string, "{}={}"}}]), erlang:halt().'
 
         for option in ('defragmenter_enabled',
                        'max_num_shards',
@@ -138,7 +138,6 @@ class ClusterManager(object):
                     for bucket in self.test_config.buckets:
                         diag_eval = cmd.format(bucket, option, value)
                         self.rest.run_diag_eval(master, diag_eval)
-                self.remote.restart()
 
     def tune_logging(self):
         self.remote.tune_log_rotation()
