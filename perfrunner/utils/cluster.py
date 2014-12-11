@@ -138,6 +138,9 @@ class ClusterManager(object):
                     for bucket in self.test_config.buckets:
                         diag_eval = cmd.format(bucket, option, value)
                         self.rest.run_diag_eval(master, diag_eval)
+                # Attempt to workaround MB-12892 - wait before restarting
+                # all nodes.
+                time.sleep(5)
                 self.remote.restart()
 
     def tune_logging(self):
